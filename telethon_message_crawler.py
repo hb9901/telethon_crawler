@@ -1,74 +1,129 @@
 import os
+import random
+import socks
 import pandas as pd
+import asyncio
+import sqlite3  # SQLite 사용을 위해 추가
 from telethon import TelegramClient
 from dotenv import load_dotenv
+from datetime import datetime
 
-# .env 파일 로드
+# .env 로드
 load_dotenv()
 
-# 환경 변수 가져오기 및 형변환
-API_ID = int(os.getenv('API_ID'))
-API_HASH = os.getenv('API_HASH')
-KEYWORD = os.getenv('KEYWORD', '').strip()
-CHANNEL_ID = int(os.getenv('CHANNEL_ID'))
-LIMIT = int(os.getenv('LIMIT', 100))
+class TelegramScraper:
+    def __init__(self):
+        # 1. 환경 변수 로드 및 설정
+        self.api_id = int(os.getenv('API_ID'))
+        self.api_hash = os.getenv('API_HASH')
+        self.channel_id = int(os.getenv('CHANNEL_ID'))
+        self.keyword = os.getenv('KEYWORD', '').strip().lower()
+        self.limit = int(os.getenv('LIMIT', 100))
+        self.download_images = os.getenv('DOWNLOAD_IMAGES', 'False').lower() == 'true'
+        
+        self.download_path = 'downloaded_photos'
+        self.db_filename = 'telegram_result.db'  # 엑셀 대신 .db 확장자 사용
+        
+        # 2. 프록시 및 클라이언트 초기화
+        self.proxy = self._get_proxy_config()
+        self.client = TelegramClient('session_name', self.api_id, self.api_hash, proxy=self.proxy)
 
-# 불리언형 환경 변수 처리
-DOWNLOAD_IMAGES_STR = os.getenv('DOWNLOAD_IMAGES', 'False').strip().lower()
-DOWNLOAD_IMAGES = DOWNLOAD_IMAGES_STR == 'true'
+    def _get_proxy_config(self):
+        """.env에서 프록시 설정을 읽어 딕셔너리로 반환"""
+        proxy_env = os.getenv('PROXY_LIST', '').strip()
+        if not proxy_env:
+            print("🌐 프록시 설정 없음: 직접 연결 모드")
+            return None
 
-DOWNLOAD_PATH = 'downloaded_photos'
-EXCEL_FILENAME = 'telegram_result.xlsx'
-
-client = TelegramClient('session_name', API_ID, API_HASH)
-
-# --- 함수 분리: 사진 저장 로직 ---
-async def download_photo_media(message, folder):
-    if not os.path.exists(folder):
-        os.makedirs(folder)
-    # 파일명을 메시지 ID로 저장하여 중복 방지
-    path = await client.download_media(message.photo, file=os.path.join(folder, f"{message.id}.jpg"))
-    return path
-
-# --- 메인 로직 ---
-async def main():
-    channel = await client.get_entity(CHANNEL_ID)
-    
-    # .env에서 가져온 LIMIT 값을 사용
-    print(f"🔎 최근 {LIMIT}개의 메시지를 확인합니다...")
-    messages = await client.get_messages(channel, limit=LIMIT)
-    
-    data_list = []
-
-    for message in messages:
-        # 키워드 필터링 로직
-        is_keyword_match = not KEYWORD or (message.text and KEYWORD.lower() in message.text.lower())
-
-        if is_keyword_match:
-            img_info = "No Image"
+        try:
+            proxies = [p.strip() for p in proxy_env.split(',') if p.strip()]
+            target = random.choice(proxies)
+            parts = target.split(':')
             
-            if message.photo:
-                if DOWNLOAD_IMAGES:
-                    print(f"📸 사진 다운로드 중 (메시지 ID: {message.id})...")
-                    img_info = await download_photo_media(message, DOWNLOAD_PATH)
-                else:
-                    photo = message.photo
-                    img_info = f"PhotoID:{photo.id} | AccessHash:{photo.access_hash}"
+            if len(parts) < 2:
+                return None
 
-            data_list.append({
-                'ID': message.id,
-                'Text': (message.text or "").replace('\n', ' '),
-                'Date': message.date.strftime('%Y-%m-%d %H:%M:%S'),
-                'Image': img_info
-            })
+            config = {
+                'proxy_type': socks.SOCKS5,
+                'addr': parts[0],
+                'port': int(parts[1]),
+                'rdns': True
+            }
+            if len(parts) == 4:
+                config['username'], config['password'] = parts[2], parts[3]
+            
+            print(f"📡 프록시 선택됨: {config['addr']}:{config['port']}")
+            return config
+        except Exception as e:
+            print(f"⚠️ 프록시 파싱 에러: {e}")
+            return None
 
-    # 데이터프레임 생성 및 엑셀 저장
-    df = pd.DataFrame(data_list)
-    df.to_excel(EXCEL_FILENAME, index=False)
-    
-    print(f"\n" + "="*30)
-    print(f"✅ 작업 완료!")
+    async def download_photo(self, message):
+        """사진 다운로드 처리"""
+        if not os.path.exists(self.download_path):
+            os.makedirs(self.download_path)
+        
+        file_path = os.path.join(self.download_path, f"{message.id}.jpg")
+        return await self.client.download_media(message.photo, file=file_path)
 
+    async def run(self):
+        """메인 실행 로직"""
+        try:
+            print("🔗 텔레그램 연결 중...")
+            await self.client.connect()
 
-with client:
-    client.loop.run_until_complete(main())
+            if not await self.client.is_user_authorized():
+                print("❌ 인증되지 않은 계정입니다. 로그인이 필요합니다.")
+                return
+
+            print(f"🔎 채널({self.channel_id}) 데이터 추출 시작...")
+            entity = await self.client.get_entity(self.channel_id)
+            messages = await self.client.get_messages(entity, limit=self.limit)
+
+            data = []
+            for msg in messages:
+                content = msg.text if msg.text else ""
+                if self.keyword and self.keyword not in content.lower():
+                    continue
+
+                img_info = "No Image"
+                if msg.photo:
+                    if self.download_images:
+                        img_info = await self.download_photo(msg)
+                    else:
+                        img_info = f"PhotoID:{msg.photo.id}"
+
+                data.append({
+                    'message_id': msg.id,  # DB 컬럼명 관례상 소문자/언더바 추천
+                    'content': content.replace('\n', ' '),
+                    'created_at': msg.date.strftime('%Y-%m-%d %H:%M:%S'),
+                    'image_info': img_info
+                })
+
+            # 데이터 저장 (SQLite)
+            if data:
+                df = pd.DataFrame(data)
+                
+                # DB 연결 (파일이 없으면 자동 생성됨)
+                conn = sqlite3.connect(self.db_filename)
+                
+                # pandas를 이용해 테이블로 저장
+                # if_exists='replace': 실행 시마다 테이블 초기화 후 저장
+                # if_exists='append': 실행 시마다 기존 데이터 뒤에 추가
+                df.to_sql('messages', conn, if_exists='replace', index=False)
+                
+                conn.close()
+                print(f"✅ 완료! {len(data)}개의 메시지가 {self.db_filename}의 'messages' 테이블에 저장되었습니다.")
+            else:
+                print("ℹ️ 조건에 맞는 메시지가 없습니다.")
+
+        except Exception as e:
+            print(f"❌ 실행 중 오류 발생: {e}")
+        finally:
+            await self.client.disconnect()
+
+# 실행부
+if __name__ == "__main__":
+    scraper = TelegramScraper()
+    with scraper.client:
+        scraper.client.loop.run_until_complete(scraper.run())
