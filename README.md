@@ -36,6 +36,9 @@ pip install PySocks
 ```text
 API_ID=발급받은 api_id
 API_HASH=발급받은 api_hash
+
+#프록시 사용시 작성
+PROXY_LIST=xxx.xxx.xx.xxx:xxxx, xxxx.xxx.xx.xxx:xxxx:user1:pw1
 ```
 ---
 
