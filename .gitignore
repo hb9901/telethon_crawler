@@ -1,9 +1,10 @@
 # 이미지 다운로드 폴더 제외
 downloaded_photos/
 
-# 엑셀 결과 파일 제외
+# 결과 파일 제외
 *.xlsx
 *.csv
+*.db
 
 # 텔레그램 세션 및 설정 파일 (보안 중요)
 *.session
