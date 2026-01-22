@@ -23,7 +23,7 @@ pip install PySocks
 스크립트를 사용하기 위해서는 텔레그램 API 권한이 필요합니다.
 1. [my.telegram.org](https://my.telegram.org/)에 접속하여 로그인합니다.
 2. **API development tools**에 들어가서 새로운 애플리케이션을 생성합니다.
-3. 발행된 **App api_id**와 **App api_hash**를 안전한 곳에 기록해두세요.
+3. 발행된 **App api_id**와 **App api_hash**를 기록해 둡니다. 
 
 ---
 
