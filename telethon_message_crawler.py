@@ -4,186 +4,150 @@ import socks
 import sqlite3
 import asyncio
 import pandas as pd
+import logging
+from dataclasses import dataclass
 from telethon import TelegramClient
 from dotenv import load_dotenv
 
-# 환경변수 로드
+# 로깅 설정
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%H:%M:%S')
+logger = logging.getLogger(__name__)
 load_dotenv()
 
-class TelegramScraper:
-    def __init__(self):
-        # 1. 기본 설정 (환경변수)
-        self.api_id = int(os.getenv('API_ID'))
-        self.api_hash = os.getenv('API_HASH')
-        
-        # 2. 크롤링 옵션 (실행 시 할당)
-        self.target_id = None
-        self.keyword = ""
-        self.limit = 100
-        self.download_images = False
-        
-        # 3. 경로 및 파일 설정
-        self.db_path = 'telegram_result.db'
-        self.img_dir = 'downloaded_photos'
-        
-        # 4. 프록시 및 클라이언트 초기화
-        self.proxy = self._setup_proxy()
-        self.client = TelegramClient('scraper_session', self.api_id, self.api_hash, proxy=self.proxy)
+@dataclass
+class Config:
+    API_ID: int = int(os.getenv('API_ID', 0))
+    API_HASH: str = os.getenv('API_HASH', '')
+    PROXY_LIST: str = os.getenv('PROXY_LIST', '')
+    DB_PATH: str = 'telegram_result.db'
+    EXCEL_PATH: str = 'telegram_result.xlsx'
+    IMG_DIR: str = 'downloaded_photos'
+    
+    # 딜레이 설정 (수정됨)
+    DELAY_MSG_MIN: float = 0.2
+    DELAY_MSG_MAX: float = 0.5
+    DELAY_CHUNK: float = 1.0    # 5.0 -> 1.0초로 변경
+    DELAY_IMAGE: float = 0.5    # 1.5 -> 0.5초로 변경
+    # DELAY_ROOM 설정 삭제됨
 
-    def _setup_proxy(self):
-        """프록시 리스트에서 무작위 선택 및 설정"""
-        proxy_env = os.getenv('PROXY_LIST', '').strip()
-        if not proxy_env:
-            print("🌐 프록시 미설정: 직접 연결 모드로 진행합니다.")
+class DataStorage:
+    def __init__(self, config: Config):
+        self.config = config
+
+    def save(self, data):
+        if not data: return
+        df = pd.DataFrame(data)
+        
+        try:
+            with sqlite3.connect(self.config.DB_PATH) as conn:
+                df.to_sql('messages', conn, if_exists='append', index=False)
+            logger.info(f"[SAVE] DB Saved: {len(data)} items")
+        except Exception as e:
+            logger.error(f"[ERROR] DB Error: {e}")
+
+        try:
+            if os.path.exists(self.config.EXCEL_PATH):
+                existing = pd.read_excel(self.config.EXCEL_PATH)
+                combined = pd.concat([existing, df], ignore_index=True)
+                combined.to_excel(self.config.EXCEL_PATH, index=False)
+            else:
+                df.to_excel(self.config.EXCEL_PATH, index=False)
+            logger.info(f"[SAVE] Excel Saved")
+        except Exception as e:
+            logger.error(f"[ERROR] Excel Error: {e}")
+
+class TelegramCrawler:
+    def __init__(self, config: Config):
+        self.config = config
+        self.client = TelegramClient('scraper_session', config.API_ID, config.API_HASH, proxy=self._get_proxy())
+
+    def _get_proxy(self):
+        if not self.config.PROXY_LIST: 
+            logger.warning("[PROXY] No Proxy Set (Direct Connection)")
             return None
         try:
-            proxies = [p.strip() for p in proxy_env.split(',') if p.strip()]
+            proxies = [p.strip() for p in self.config.PROXY_LIST.split(',') if p.strip()]
             choice = random.choice(proxies).split(':')
-            config = {
+            proxy = {
                 'proxy_type': socks.SOCKS5,
                 'addr': choice[0],
                 'port': int(choice[1]),
                 'rdns': True
             }
             if len(choice) == 4:
-                config['username'], config['password'] = choice[2], choice[3]
-            print(f"📡 프록시 적용: {config['addr']}:{config['port']}")
-            return config
-        except Exception:
-            print("⚠️ 프록시 설정 형식이 올바르지 않습니다. 직접 연결을 시도합니다.")
+                proxy['username'], proxy['password'] = choice[2], choice[3]
+            logger.info(f"[PROXY] Connected: {choice[0]}")
+            return proxy
+        except: 
+            logger.error("[ERROR] Proxy Config Error")
             return None
 
-    async def ensure_connection(self):
-        """서버 연결 및 로그인 상태 확인"""
-        if not self.client.is_connected():
-            await self.client.connect()
-        if not await self.client.is_user_authorized():
-            print("🔑 첫 실행: 인증이 필요합니다.")
-            await self.client.start()
-            print("✅ 인증 성공!")
+    async def start(self):
+        await self.client.start()
 
-    def _ask_user_options(self, include_id=False):
-        """사용자로부터 수집 조건 입력받기"""
-        print("\n" + "─"*30 + "\n[ 수집 옵션 설정 ]")
-        
-        if include_id:
-            while True:
-                val = input("🆔 대상 채팅방 ID: ").strip()
-                if val:
-                    try: self.target_id = int(val); break
-                    except ValueError: print("❌ ID는 숫자로 입력해주세요.")
-                else: print("❌ ID 입력은 필수입니다.")
+    async def run_full_scan(self, storage):
+        if not os.path.exists(self.config.IMG_DIR):
+            os.makedirs(self.config.IMG_DIR)
 
-        self.keyword = input("🔍 필터링 키워드 (엔터 시 전체): ").strip().lower()
-        
-        lim = input("📊 수집 개수 (기본 100): ").strip()
-        self.limit = int(lim) if lim.isdigit() else 100
-        
-        dl = input("📸 이미지 다운로드? (y/n, 기본 n): ").strip().lower()
-        self.download_images = True if dl == 'y' else False
-        print("─"*30)
+        async for dialog in self.client.iter_dialogs():
+            # 안전한 출력을 위해 채팅방 이름 인코딩 처리 시도
+            safe_name = dialog.name.encode('utf-8', 'ignore').decode('utf-8')
+            logger.info(f"--------------------------------------------------")
+            logger.info(f"[START] Processing Room: {safe_name}")
+            
+            data = []
+            count = 0
 
-    async def _fetch_messages(self, entity, chat_name):
-        """실제 메시지 수집 로직 (메서드 분리)"""
-        try:
-            messages = await self.client.get_messages(entity, limit=self.limit)
-            rows = []
-            for m in messages:
-                text = m.text if m.text else ""
-                if self.keyword and self.keyword not in text.lower():
-                    continue
+            try:
+                async for m in self.client.iter_messages(dialog.entity, limit=None):
+                    img_path = "No Image"
+                    
+                    if m.photo:
+                        fpath = os.path.join(self.config.IMG_DIR, f"{m.id}.jpg")
+                        if not os.path.exists(fpath):
+                            try:
+                                await self.client.download_media(m.photo, file=fpath)
+                                await asyncio.sleep(self.config.DELAY_IMAGE) # 0.5초 대기
+                            except Exception:
+                                pass # 이미지 다운 실패시 무시
+                        img_path = fpath
 
-                img_val = "No Image"
-                if m.photo:
-                    if self.download_images:
-                        if not os.path.exists(self.img_dir): os.makedirs(self.img_dir)
-                        img_val = await self.client.download_media(m.photo, file=os.path.join(self.img_dir, f"{m.id}.jpg"))
-                    else:
-                        img_val = f"PhotoID:{m.photo.id}"
+                    data.append({
+                        'chat': dialog.name,
+                        'id': m.id,
+                        'text': (m.text or "").replace('\n', ' '),
+                        'date': m.date.strftime('%Y-%m-%d %H:%M:%S'),
+                        'image': img_path
+                    })
 
-                rows.append({
-                    'chat_name': chat_name,
-                    'msg_id': m.id,
-                    'content': text.replace('\n', ' '),
-                    'date': m.date.strftime('%Y-%m-%d %H:%M:%S'),
-                    'image': img_val
-                })
-            return rows
-        except Exception as e:
-            print(f"⚠️ {chat_name} 수집 중 오류: {e}")
-            return []
+                    count += 1
+                    await asyncio.sleep(random.uniform(self.config.DELAY_MSG_MIN, self.config.DELAY_MSG_MAX))
+                    
+                    if count % 100 == 0:
+                        logger.info(f"[INFO] Collected {count} messages... (Resting)")
+                        await asyncio.sleep(self.config.DELAY_CHUNK) # 1.0초 대기
 
-    def _save_to_db(self, data):
-        """데이터를 SQLite DB에 저장"""
-        if not data:
-            print("ℹ️ 수집된 데이터가 없어 저장을 건너뜁니다.")
-            return
-        
-        df = pd.DataFrame(data)
-        with sqlite3.connect(self.db_path) as conn:
-            df.to_sql('messages', conn, if_exists='replace', index=False)
-        print(f"💾 저장 완료: {len(data)}건 ({self.db_path})")
+                storage.save(data)
+                
+                # [삭제됨] 방 변경 대기 로직 (DELAY_ROOM) 제거 완료
+                # 바로 다음 방으로 넘어갑니다.
 
-    # --- 실행 기능들 ---
+            except Exception as e:
+                logger.error(f"[ERROR] In Room {safe_name}: {e}")
 
-    async def cmd_show_list(self):
-        """기능 1: 대화방 리스트 확인"""
-        await self.ensure_connection()
-        print(f"\n{'[ 대화방 이름 ]':<25} | {'[ ID ]'}")
-        print("─"*50)
-        async for d in self.client.iter_dialogs():
-            print(f"{str(d.name)[:25]:<25} | {d.id}")
-        print("─"*50)
-
-    async def cmd_single_scrape(self):
-        """기능 2: 특정 방 크롤링"""
-        await self.ensure_connection()
-        self._ask_user_options(include_id=True)
-        try:
-            ent = await self.client.get_entity(self.target_id)
-            title = getattr(ent, 'title', 'Private Chat')
-            print(f"🚀 [{title}] 크롤링 중...")
-            data = await self._fetch_messages(ent, title)
-            self._save_to_db(data)
-        except Exception as e:
-            print(f"❌ 해당 ID를 찾을 수 없습니다: {e}")
-
-    async def cmd_all_scrape(self):
-        """기능 3: 전체 크롤링"""
-        await self.ensure_connection()
-        self._ask_user_options(include_id=False)
-        print("🚀 전체 대화방 수집을 시작합니다...")
-        
-        all_results = []
-        async for d in self.client.iter_dialogs():
-            print(f"🔄 [{d.name}] 읽는 중...")
-            all_results.extend(await self._fetch_messages(d.id, d.name))
-        
-        self._save_to_db(all_results)
-
-# --- 메인 메뉴 컨트롤러 ---
 async def main():
-    app = TelegramScraper()
-    while True:
-        print("\n" + "■"*30)
-        print("   TELEGRAM CRAWLER V2.0")
-        print("   1. 대화방 리스트/ID 확인")
-        print("   2. 선택 채팅방 크롤링")
-        print("   3. 전체 채팅방 크롤링")
-        print("   0. 프로그램 종료")
-        print("■"*30)
-        
-        menu = input("👉 선택: ").strip()
-        
-        if menu == '1': await app.cmd_show_list()
-        elif menu == '2': await app.cmd_single_scrape()
-        elif menu == '3': await app.cmd_all_scrape()
-        elif menu == '0': break
-        else: print("❌ 메뉴 번호를 다시 확인해주세요.")
+    print("[SYSTEM] Crawler Started...")
+    config = Config()
+    storage = DataStorage(config)
+    crawler = TelegramCrawler(config)
     
-    if app.client.is_connected():
-        await app.client.disconnect()
-    print("👋 프로그램을 종료합니다.")
+    await crawler.start()
+    await crawler.run_full_scan(storage)
+    await crawler.client.disconnect()
+    print("[SYSTEM] Finished.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
