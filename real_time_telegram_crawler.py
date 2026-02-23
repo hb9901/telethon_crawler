@@ -11,6 +11,7 @@ from telethon import TelegramClient
 from telethon.tl.types import Message, MessageMediaWebPage
 from dotenv import load_dotenv
 
+# 로깅 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -53,19 +54,22 @@ class DataStorage:
         async with self.lock:
             try:
                 df = pd.DataFrame(data)
+                # 1. SQLite 저장
                 with sqlite3.connect(self.config.DB_PATH) as conn:
                     df.to_sql('messages', conn, if_exists='append', index=False)
                 
+                # 2. 엑셀 저장 (기존 데이터가 있으면 합쳐서 저장)
                 if not os.path.exists(self.config.EXCEL_PATH):
                     df.to_excel(self.config.EXCEL_PATH, index=False)
                 else:
-                    with pd.ExcelWriter(self.config.EXCEL_PATH, engine='openpyxl', mode='a', if_sheet_exists='overlay') as writer:
-                        try:
-                            existing_df = pd.read_excel(self.config.EXCEL_PATH)
-                            pd.concat([existing_df, df], ignore_index=True).to_excel(writer, index=False)
-                        except:
-                            df.to_excel(self.config.EXCEL_PATH, index=False)
-                logger.info(f"[저장완료] {len(data)}건 기록")
+                    try:
+                        existing_df = pd.read_excel(self.config.EXCEL_PATH)
+                        pd.concat([existing_df, df], ignore_index=True).to_excel(self.config.EXCEL_PATH, index=False)
+                    except Exception as e:
+                        logger.error(f"엑셀 업데이트 실패 (새 파일로 생성): {e}")
+                        df.to_excel(self.config.EXCEL_PATH, index=False)
+                
+                logger.info(f"[저장완료] {len(data)}건 기록 추가됨")
             except Exception as e:
                 logger.error(f"저장 중 오류 발생: {e}")
 
@@ -75,61 +79,64 @@ class TelegramCrawler:
         self.client = TelegramClient('scraper_session', config.API_ID, config.API_HASH)
 
     async def download_image(self, message: Message) -> str:
-        # 1. 메시지에 사진(photo)이 있는지 확인
+        """이미지 고유 ID를 확인하여 다운로드 (없으면 메시지 ID 사용)"""
         if message.photo:
             try:
-                # 2. 이미지 고유 ID 확인 (message.photo.id)
-                # 사진 객체가 있으면 photo.id를 쓰고, 없으면 안전하게 message.id 사용
+                # 텔레그램 이미지 고유 ID 추출
                 photo_id = getattr(message.photo, 'id', message.id)
-                
-                # 파일명 설정 (예: 5432167890123.jpg)
                 filename = f"{photo_id}.jpg"
                 save_path = os.path.join(self.config.IMG_DIR, filename)
                 
-                # 3. 중복 다운로드 방지 (이미 같은 ID의 파일이 있다면 패스)
+                # 이미 존재하면 다운로드 스킵
                 if os.path.exists(save_path):
-                    # logger.info(f"기존 이미지 존재: {filename}")
                     return save_path
 
-                # 4. 실제 다운로드 실행
                 path = await message.download_media(file=save_path)
-                
-                # 서버 부하 방지를 위한 짧은 대기
                 await asyncio.sleep(self.config.DELAY_IMAGE)
-                
                 return path if path else ""
             except Exception as e:
-                logger.error(f"이미지 다운로드 실패 (Msg ID: {message.id}): {e}")
+                logger.error(f"이미지 다운로드 실패: {e}")
                 return ""
-        
         return ""
-    
-    async def run_scan(self, storage: DataStorage, only_unread: bool = False):
+
+    async def run_scan(self, storage: DataStorage, only_unread: bool = False, skip_existing_chats: bool = True):
         await self.client.start()
+        
+        # 1. 기존 엑셀에서 이미 수집된 채팅방 ID 목록 추출
+        existing_chat_ids = set()
+        if skip_existing_chats and os.path.exists(self.config.EXCEL_PATH):
+            try:
+                # 엑셀 전체를 읽지 않고 channel_id 컬럼만 읽어 속도 최적화
+                temp_df = pd.read_excel(self.config.EXCEL_PATH, usecols=['channel_id'])
+                existing_chat_ids = set(temp_df['channel_id'].unique())
+                logger.info(f"기존 엑셀에서 {len(existing_chat_ids)}개의 채팅방 확인.")
+            except Exception as e:
+                logger.warning(f"기존 엑셀 로드 실패: {e}")
+
         dialogs = await self.client.get_dialogs()
         
         for dialog in dialogs:
-            # 안 읽은 메시지만 수집 모드일 때, 안 읽은 개수가 0이면 스킵
+            # 2. 엑셀에 이미 있는 방이면 건너뛰기
+            if skip_existing_chats and dialog.id in existing_chat_ids:
+                logger.info(f"===> [{dialog.name}] 이미 저장된 방이므로 스킵합니다.")
+                continue
+
             if only_unread and dialog.unread_count == 0:
                 continue
 
             room_name = dialog.name or "Unknown"
             curr_channel_id = dialog.id
-            
-            # 수집할 메시지 개수 설정
             msg_limit = dialog.unread_count if only_unread else None
             
-            logger.info(f"===> [{room_name}] {'안 읽은 메시지 ' + str(msg_limit) + '건' if only_unread else '전체'} 수집 시작")
+            logger.info(f"===> [{room_name}] 수집 시작 (ID: {curr_channel_id})")
             
             current_room_data = []
-            
-            # iter_messages에 limit을 설정하여 안 읽은 개수만큼만 가져옴
             async for m in self.client.iter_messages(dialog, limit=msg_limit):
+                # 텍스트와 이미지 둘 다 없는 경우 스킵
                 if not m.text and (not m.media or isinstance(m.media, MessageMediaWebPage)):
                     continue
 
                 is_channel_post = bool(m.sender_id == curr_channel_id)
-                
                 sender_name = ""
                 try:
                     sender = await m.get_sender()
@@ -138,6 +145,7 @@ class TelegramCrawler:
                                       f"{getattr(sender, 'first_name', '')} {getattr(sender, 'last_name', '')}".strip()
                 except: pass
 
+                # 이미지 다운로드 로직 호출
                 img_path = await self.download_image(m)
 
                 current_room_data.append({
@@ -152,12 +160,14 @@ class TelegramCrawler:
                     'image_path': img_path
                 })
 
+                # 일정 주기마다 저장
                 if len(current_room_data) >= self.config.SAVE_INTERVAL:
                     await storage.save_to_all(current_room_data)
                     current_room_data.clear()
                 
                 await asyncio.sleep(random.uniform(*self.config.DELAY_MSG))
 
+            # 잔여 데이터 저장
             if current_room_data:
                 await storage.save_to_all(current_room_data)
             
@@ -165,19 +175,30 @@ class TelegramCrawler:
 
 async def main():
     config = Config()
+    if not config.API_ID or not config.API_HASH:
+        logger.error(".env 파일에 API_ID와 API_HASH를 설정해주세요.")
+        return
+
     storage = DataStorage(config)
     crawler = TelegramCrawler(config)
     
-    print("="*30)
-    print("1. 전체 메시지 수집")
+    print("="*35)
+    print(" 텔레그램 메시지 크롤러 (엑셀 중복방지 포함)")
+    print("="*35)
+    print("1. 전체 메시지 수집 (기존 방 제외)")
     print("2. 안 읽은 메시지만 수집")
-    print("="*30)
+    print("="*35)
     choice = input("모드를 선택하세요 (1/2): ")
     
     only_unread = True if choice == "2" else False
+    # 1번 선택 시 기존 엑셀에 있는 방은 아예 스킵합니다.
+    skip_existing = True if choice == "1" else False
 
     async with crawler.client:
-        await crawler.run_scan(storage, only_unread=only_unread)
+        await crawler.run_scan(storage, only_unread=only_unread, skip_existing_chats=skip_existing)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n사용자에 의해 종료되었습니다.")

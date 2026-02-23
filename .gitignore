@@ -14,3 +14,6 @@ downloaded_photos/
 # 파이썬 캐시 파일
 __pycache__/
 *.py[cod]
+
+merge.py
+telethon_test.py
